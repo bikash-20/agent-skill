@@ -6,6 +6,8 @@
 
 This document captures the **future-state architecture** of the project the agent is currently working on, the **capacity** the system handles today and must support later, and the **tradeoffs** behind every major decision. The agent must consult this file before suggesting any new dependency, schema change, infra choice, or architectural pattern.
 
+Numbers marked with `~` are planning estimates, not guarantees. Production measurements, load-test results, and incident data take precedence over estimates; update this document when they change.
+
 ---
 
 ## 1. Capacity — current vs. target
@@ -46,6 +48,24 @@ This document captures the **future-state architecture** of the project the agen
 - **LLM traffic dominates cost.** ~70% of unit cost is LLM, not infra. Cost discipline on prompts matters more than infra tuning.
 - **Single-tenant today, multi-tenant eventually.** Data model must accommodate tenant isolation without rewrites.
 
+### Measurement definitions
+
+- **Active user:** a user with at least one authenticated request in a rolling 15-minute window. Confirm this definition before using concurrency figures for capacity planning.
+- **API latency:** measured at the API edge for non-streaming requests. LLM generation time is reported separately once LLM work leaves the request path.
+- **Cost per 1k requests:** total monthly platform cost divided by the same month’s billable API requests, multiplied by 1,000. It is not comparable across periods until the request denominator is instrumented.
+- **Target workload:** the 8,000 RPS peak and 4,000 RPS sustained figures require a load test using the expected 80/20 read/write mix, representative response sizes, cache hit rates, and LLM job enqueue rate. They are not capacity claims until that test passes.
+
+### Reliability and safety contracts
+
+These are design constraints, not optional roadmap features:
+
+- **Availability SLO:** 99.9% monthly for the core API, excluding planned maintenance only when announced in advance. This permits about 43 minutes of unavailability per month; error-budget burn drives release decisions.
+- **Recovery objectives:** define and test an initial `RTO <= 30 minutes` and `RPO <= 5 minutes` for regional failure before committing to a customer SLA. The multi-region phase must improve these values with a documented failover drill.
+- **Tenant isolation:** every tenant-owned row, cache key, queue message, vector, log field, and authorization decision carries a tenant identifier. Enforce isolation in the service layer and database query patterns; never rely on a client-supplied tenant ID alone.
+- **External calls:** every database, queue, cache, and LLM call has a bounded timeout, limited retries with jitter, and a failure metric. Retry budgets and circuit breakers must prevent an outage from becoming a request storm.
+- **Async work:** the durable queue is the source of truth for pending work. Redis may accelerate coordination or caching, but it is not the only copy of a job. Workers use durable idempotency keys, bounded concurrency, backpressure, and a dead-letter path with replay controls.
+- **Data lifecycle:** define retention, deletion, backup encryption, restore testing, and tenant export requirements before introducing replicas, vectors, or cross-region copies.
+
 ---
 
 ## 2. Architecture roadmap
@@ -75,8 +95,10 @@ This document captures the **future-state architecture** of the project the agen
 ```
 
 - Move LLM calls out of request path; stream results back via SSE/WebSocket
+- Persist job state so clients can reconnect and replay the latest result; SSE is the default transport unless bidirectional interaction requires WebSocket.
 - Read replica for list endpoints
-- Redis for hot data + idempotency keys
+- Redis for hot data and short-lived coordination; durable idempotency records live in Postgres or the job system
+- Use a durable managed queue as the queue of record; Redis-backed queues require an explicit durability and recovery test
 - CDN for static assets
 - Introduce feature flags
 - CI/CD with rollback one-click
@@ -111,8 +133,8 @@ This document captures the **future-state architecture** of the project the agen
                                           └── async replication ──┘
 ```
 
-- Active-active multi-region for reads
-- Primary-region writes, with conflict resolution
+- Active-active request routing for reads and stateless work; writes remain single-primary until a tested conflict strategy exists
+- Primary-region writes, with explicit failover ownership and conflict resolution before any multi-writer design
 - Multi-region LLM routing (data residency rules apply)
 - SLO-driven autoscaling
 - Per-tenant rate limits and quotas
@@ -132,7 +154,7 @@ For every major architectural choice, this is what we picked, what we rejected, 
 
 - **Picked now:** Single Postgres instance. Vertical scale headroom remaining.
 - **Rejected:** Sharding from day one. Operational cost outweighs benefit at current size.
-- **Reverse when:** Write throughput exceeds one instance's capacity, OR single-region failover requires >30s RTO.
+- **Reverse when:** measured write throughput or storage exceeds one instance's safe limit, OR tenant-level isolation/compliance requires separate failure domains. Sharding does not by itself solve regional failover.
 - **Reversal path:** Logical replication → dual-write → cutover, one shard at a time.
 
 ### 3.2 Monolith → modular monolith → services
@@ -153,8 +175,8 @@ For every major architectural choice, this is what we picked, what we rejected, 
 
 - **Picked now:** Synchronous LLM in request path. Simpler code, simpler UX.
 - **Rejected:** Async now. Adds infrastructure (queue, SSE, retry, partial state) that we don't yet need.
-- **Reverse when:** p95 LLM latency exceeds 500 ms, OR LLM failures cause >1% user-visible error rate.
-- **Reversal path:** Wrap LLM calls in a job; stream results back; introduce idempotency keys for retries.
+- **Reverse when:** p95 LLM latency exceeds 500 ms for two consecutive measurement windows, OR LLM failures cause >1% user-visible error rate, OR request timeouts materially consume the API error budget.
+- **Reversal path:** Persist a job and status record → enqueue to a durable queue → process with bounded workers → expose reconnectable SSE → add idempotency and dead-letter replay before flipping the default.
 
 ### 3.5 Frontier model everywhere → cascade routing
 
@@ -192,6 +214,8 @@ When we hit each ceiling, this is the move.
 | **Network egress** | > 70% of quota | CDN for static, compress responses | Multi-region to reduce backhaul |
 | **Deployment downtime** | Deploy causes >30s error rate | Blue-green deploys | Zero-downtime rolling deploys |
 | **Single-region outage** | Any regional outage drops users to 0% | Cross-region read replica (manual failover) | Active-active multi-region |
+| **Queue backlog** | Oldest queued job exceeds 2x its latency SLO or queue depth grows for 10 minutes | Apply admission control and reduce concurrency | Scale workers, add priority lanes, or move workloads by region |
+| **Tenant isolation** | Cross-tenant authorization or query test fails | Stop rollout and revoke affected access | Database row-level policies or separate tenant partitions |
 
 ---
 
@@ -207,7 +231,7 @@ When we hit each ceiling, this is the move.
 - **Infra:** ~$6,000/month (multi-node API, Postgres + replicas, Redis cluster, multi-region)
 - **LLM:** ~$15,000/month (150k calls/day, but cascade + caching drop per-call cost to ~$0.003)
 - **Total:** ~$21,000/month
-- **Cost per 1k requests:** < $0.05 (~58% reduction)
+- **Cost per 1k requests:** < $0.05, measured with the definition in Section 1. The current `$0.12` and target `<$0.05` figures must be re-baselined against instrumented billable-request counts before being used as acceptance criteria.
 
 ### Cost-control rules for the agent
 
@@ -231,6 +255,8 @@ When we hit each ceiling, this is the move.
 | Monolith | Modular monolith | Module boundaries stable | Code organization first, deploys stay unified |
 | Modular monolith | Services | Team or cadence demands | Extract behind internal API → deploy separately |
 
+Each migration requires four gates: a representative load test, a backwards-compatible data migration, a rollback switch or previous deployment, and an observation window covering latency, errors, cost, queue backlog, and data correctness. No phase is complete because infrastructure was provisioned; it is complete when its measured exit criteria pass.
+
 ---
 
 ## 7. What the agent should NOT propose
@@ -246,7 +272,7 @@ Until the trigger conditions in this document are met, do not propose:
 - A new language runtime (we have one)
 - A service mesh (overkill until services exist)
 
-Propose any of these only with: (a) the trigger condition it addresses, (b) the operational cost we're accepting, and (c) the rollback plan if it doesn't deliver.
+Propose any of these only with: (a) the trigger condition it addresses, (b) the measured evidence, (c) the operational cost we're accepting, (d) the rollback plan if it doesn't deliver, and (e) the data-consistency and recovery impact.
 
 ---
 
@@ -261,6 +287,8 @@ Before proposing a new architecture, dependency, or major refactor, answer:
 5. **How does this interact with the cost model in Section 5?**
 6. **Does this match the roadmap phase we're in?** (Section 2.)
 7. **What breaks first at 10x current scale?** (From Section 4.)
+8. **What is the failure mode and operator action?** Include timeout, retry, backpressure, alert, and rollback behavior.
+9. **What data is copied, retained, or deleted?** Include tenant scope, residency, backup, and restore implications.
 
 If the proposal doesn't survive these questions, it's not ready to implement.
 
@@ -270,6 +298,8 @@ If the proposal doesn't survive these questions, it's not ready to implement.
 
 - Do we need a per-tenant data residency commitment? (Drives multi-region timeline.)
 - What's our SLO commitment to paying customers vs. free tier? (Drives uptime target.)
+- What are the measured request and LLM-job denominators behind the current cost figures? (Required before enforcing unit-cost targets.)
+- What are the recovery owners and scheduled dates for the first backup-restore and regional-failover drills? (Required before claiming RTO/RPO.)
 - How much can we charge per seat before model cascade savings become customer-visible? (Drives pricing roadmap.)
 - Is the LLM surface area a moat (worth investing) or commodity (worth minimizing)? (Drives model-tiering strategy.)
 
@@ -278,6 +308,7 @@ If the proposal doesn't survive these questions, it's not ready to implement.
 ## 10. Update log
 
 - **2026-09-12** — Initial draft. Reflects current measured capacity and 12-month targets.
+- **2026-09-12** — Added measurement definitions, reliability contracts, durable async-work requirements, migration gates, and multi-region consistency constraints.
 
 ---
 
