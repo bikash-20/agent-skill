@@ -1,6 +1,6 @@
 ---
 name: skills
-description: Apply senior engineering standards when implementing or reviewing frontend, backend, authentication, API, database, or LLM-integrated code. Use this for changes that alter behavior, data flow, security, reliability, performance, or user-facing interaction; skip it for purely editorial changes.
+description: Apply senior engineering standards when implementing or reviewing frontend, backend, authentication, API, database, or LLM-integrated code. Use this for changes that alter behavior, data flow, security, reliability, performance, or user-facing interaction; skip it for purely editorial changes. When the project has a SYSTEM_DESIGN.md, treat it as authoritative for architecture and capacity decisions.
 ---
 
 # Senior Full-Stack + AI Engineering Standards
@@ -564,3 +564,76 @@ These end discussions.
 - **"We'll add observability later"** — no, you won't. Add it now.
 - **Magic numbers in tests** — `assertEquals(x, 42)` instead of a named constant.
 - **Mocking what you're testing** — tautological tests pass while the real thing breaks.
+
+---
+
+## 20. System Design Discipline
+
+Code lives inside a system. The agent must reason about that system, not just the file in front of it. This section defines when and how to invoke system-design thinking, and how to use `SYSTEM_DESIGN.md` when it exists in the repo.
+
+### When to think at the system level
+
+Trigger a system-level review when **any** of these are true:
+
+- Adding a new service, worker, queue, or persistent store.
+- Changing a database schema or introducing a new datastore.
+- Adding a new external dependency (vendor, LLM provider, third-party API).
+- Touching request-path latency, error rates, or throughput assumptions.
+- Crossing a cost or capacity threshold documented in `SYSTEM_DESIGN.md`.
+- Touching auth, payment, or any system with regulatory implications.
+
+For pure local logic changes — small refactors, isolated bug fixes, doc tweaks — code-level rules are sufficient.
+
+### How to use SYSTEM_DESIGN.md
+
+When `SYSTEM_DESIGN.md` exists in the repo, treat it as **authoritative for architecture and capacity decisions.** Specifically:
+
+1. **Read it before any architectural proposal.** New dependency, new service, new schema, new infra — all require a check against the existing roadmap.
+2. **Match the roadmap phase.** If the system is in Phase 1 (horizontal API), do not propose Phase 3 architecture (multi-region active-active) unless a trigger in `SYSTEM_DESIGN.md` has been met.
+3. **Respect capacity ceilings.** If a proposed change would push a documented metric past its ceiling, either justify the move to the next phase or propose the mitigation from the scaling-ceilings table.
+4. **Honor the tradeoffs.** Every major decision in `SYSTEM_DESIGN.md` records what was rejected and when to reverse it. Proposing the rejected path requires explicit override rationale.
+5. **Cost is a first-class concern.** Any change that affects LLM call volume, infra footprint, or per-request cost must declare the expected cost impact.
+
+When `SYSTEM_DESIGN.md` does **not** exist in the repo, do not invent one as a side task. Note the absence and proceed with code-level rules only.
+
+### Pre-design checklist
+
+Before proposing a new architecture, dependency, or major refactor, the agent must answer — and put the answers in the response:
+
+1. **What problem does this solve?** (User or system pain, not "tech I want to use.")
+2. **What is the smallest version of this that works at current scale?**
+3. **What is the trigger that tells us to scale it up?** (Concrete numbers, not vibes.)
+4. **What is the rollback plan if this is wrong?**
+5. **How does this interact with the cost model?** (LLM calls, infra, ops.)
+6. **Does this match the roadmap phase we are in?**
+7. **What breaks first at 10x current scale?**
+
+If the proposal does not survive these questions, it is not ready to implement.
+
+### Capacity reasoning
+
+The agent must be able to answer, in concrete numbers:
+
+- **How many users / requests per second does the system handle today?** (Measured, not theoretical.)
+- **What is the target capacity?** (Where the system needs to be in 6 / 12 / 24 months.)
+- **What is the bottleneck that breaks first as we scale?** (And what is the first mitigation.)
+- **What does it cost to run today vs. at target scale?** (Infra + LLM + ops.)
+
+If the agent cannot answer these, the answer is "measure first." Do not scale on assumptions; measure, then decide.
+
+### Anti-patterns in system design
+
+- **Premature microservices.** Splitting before deploy cadence or team boundaries demand it adds operational cost without engineering benefit.
+- **Proposing tech you have not used in this stack.** Match the existing stack unless the migration is justified by a documented trigger.
+- **Big-bang migrations.** Move one slice at a time. Dual-write before cutover. Old path stays runnable until the new path has proven itself.
+- **Cost-blindness.** "It works" is not enough. Every LLM-heavy feature declares expected call volume and per-1k-request cost.
+- **Architecture by analogy.** "Company X uses Y, so we should too" is not a reason. The trigger conditions must match.
+- **Hand-waving at scale.** "It will scale" is not a plan. State the bottleneck, the ceiling, and the mitigation.
+
+### When SYSTEM_DESIGN.md and SKILL.md conflict
+
+`SYSTEM_DESIGN.md` is project-specific and overrides `SKILL.md` for project-specific decisions. `SKILL.md` remains authoritative for engineering principles (security, correctness, code quality, testing). When in doubt:
+
+1. Project-specific system design rules win for *what to build*.
+2. Engineering principles in SKILL.md win for *how to build it well*.
+3. If both are silent, apply the operating loop from the top of this skill and reason from first principles.
